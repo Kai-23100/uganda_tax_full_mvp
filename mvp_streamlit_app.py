@@ -235,7 +235,7 @@ if st.button("Download Computation Summary as Excel"):
         "Withholding Tax": [withholding_tax],
         "Final Tax Payable / Claimable": [final_tax_payable],
         "Additional Notes": [additional_notes],
-
+    }
 
 st.markdown("---")
 st.markdown("**Disclaimer:** This app is a simplified tax computation tool based on Uganda ITA Cap 338 and should not replace professional tax advice.")
