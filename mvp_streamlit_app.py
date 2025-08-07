@@ -236,12 +236,15 @@ if st.button("Download Computation Summary as Excel"):
         "Final Tax Payable / Claimable": [final_tax_payable],
         "Additional Notes": [additional_notes],
     }
-    df_export = pd.DataFrame(data_export)
-    excel_data = to_excel(df_export)
-    st.download_button(label="Download Excel File",
-                       data=excel_data,
-                       file_name='uganda_tax_computation.xlsx',
-                       mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    import pandas as pd
+import io
+
+def to_excel(df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Sheet1')
+    processed_data = output.getvalue()
+    return processed_data
 
 st.markdown("---")
 st.markdown("**Disclaimer:** This app is a simplified tax computation tool based on Uganda ITA Cap 338 and should not replace professional tax advice.")
