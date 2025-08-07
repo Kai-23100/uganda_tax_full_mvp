@@ -1,81 +1,10 @@
-from pathlib import Path
-
-# Define file contents
-streamlit_app_py = """
-import streamlit as st
-import pandas as pd
-
-st.set_page_config(page_title="Uganda Tax MVP", layout="wide")
-
-st.title("🇺🇬 Uganda Business Income Tax Calculator MVP")
-st.markdown("This MVP helps Ugandan businesses compute estimated **Income Tax** under the Income Tax Act Cap 340.")
-
-tabs = st.tabs(["🧾 Tax Inputs", "📄 Financials Upload", "📊 Tax Summary"])
-
-with tabs[0]:
-    st.header("🧾 Manual Tax Input Form")
-    with st.form("tax_form"):
-        gross_income = st.number_input(
-            "Gross Income (UGX)",
-            min_value=0.0,
-            format="%.2f",
-            help="Total business revenue before deductions"
-        )
-        allowable_deductions = st.number_input(
-            "Allowable Deductions (UGX)",
-            min_value=0.0,
-            format="%.2f",
-            help="Expenses deductible under the Income Tax Act"
-        )
-        capital_allowances = st.number_input(
-            "Capital Allowances (UGX)",
-            min_value=0.0,
-            format="%.2f",
-            help="Wear and tear deductions on business assets"
-        )
-        submit_button = st.form_submit_button("Compute Tax")
-
-    if submit_button:
-        chargeable_income = gross_income - allowable_deductions - capital_allowances
-        tax_due = 0.3 * chargeable_income if chargeable_income > 0 else 0
-        st.success(f"Estimated Chargeable Income: UGX {chargeable_income:,.2f}")
-        st.success(f"Estimated Tax Due (30%): UGX {tax_due:,.2f}")
-
-with tabs[1]:
-    st.header("📄 Upload Financial Statement")
-    uploaded_file = st.file_uploader("Upload CSV file with income & expenses", type=["csv"])
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        st.dataframe(df)
-        st.info("Processing uploaded financials will be added in future releases.")
-
-with tabs[2]:
-    st.header("📊 Tax Summary")
-    st.markdown("Once inputs are entered or uploaded, summaries will appear here in future updates.")
-"""
-
-config_toml = """
 [server]
 headless = true
-port = $PORT
+port = 8501
 enableCORS = false
-"""
 
-requirements_txt = """
-streamlit
-pandas
-"""
-
-# Create the folder structure
-base_path = Path("/mnt/data/uganda_tax_mvp")
-streamlit_dir = base_path / ".streamlit"
-base_path.mkdir(parents=True, exist_ok=True)
-streamlit_dir.mkdir(parents=True, exist_ok=True)
-
-# Write files
-(base_path / "streamlit_app.py").write_text(streamlit_app_py)
-(streamlit_dir / "config.toml").write_text(config_toml)
-(base_path / "requirements.txt").write_text(requirements_txt)
-
-base_path
-
+[theme]
+primaryColor="#4B8BBE"
+backgroundColor="#FFFFFF"
+secondaryBackgroundColor="#F0F2F6"
+textColor="#262730"
