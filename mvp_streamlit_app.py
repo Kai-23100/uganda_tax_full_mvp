@@ -235,47 +235,7 @@ if st.button("Download Computation Summary as Excel"):
         "Withholding Tax": [withholding_tax],
         "Final Tax Payable / Claimable": [final_tax_payable],
         "Additional Notes": [additional_notes],
-    }
-   from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
-import io
 
-def to_pdf(df):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    elements = []
-    style = getSampleStyleSheet()
-
-    title = Paragraph("Tax Computation Summary", style['Heading1'])
-    elements.append(title)
-    elements.append(Spacer(1, 12))
-
-    data = [df.columns.tolist()] + df.values.tolist()
-    table = Table(data)
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#d3d3d3')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey)
-    ]))
-    elements.append(table)
-
-    doc.build(elements)
-    pdf = buffer.getvalue()
-    buffer.close()
-    return pdf
-    if st.button("Download PDF Report"):
-        pdf = to_pdf(df_export)
-        st.download_button(
-            label="Click to Download PDF",
-            data=pdf,
-            file_name="tax_report.pdf",
-            mime="application/pdf"
-    )
 
 st.markdown("---")
 st.markdown("**Disclaimer:** This app is a simplified tax computation tool based on Uganda ITA Cap 338 and should not replace professional tax advice.")
