@@ -1,243 +1,599 @@
+# app.py — TaxIntellilytics (Income Tax Module, Uganda)
+# Single-file Streamlit app: P&L mapping, full addbacks/allowables, progressive brackets,
+# credits & exemptions, QuickBooks stub, SQLite history, URA CSV/Excel export.
+
+import os
+import io
+import json
+import sqlite3
+from datetime import datetime
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
 import streamlit as st
 
-# Constants
-TAX_RATE = 0.30  # 30% tax on chargeable income
+# ----------------------------
+# App Config
+# ----------------------------
+st.set_page_config(page_title="TaxIntellilytics — Income Tax (Uganda)", layout="wide")
+st.title("💼 TaxIntellilytics — Income Tax (Uganda)")
+st.caption("Automating, Analyzing, and Advancing Tax Compliance in Uganda")
 
-st.set_page_config(page_title="Uganda Business Income Tax Calculator (ITA Cap 338)", layout="wide")
+DB_PATH = "taxintellilytics_history.sqlite"
 
-st.title("Uganda Business Income Tax Computation (ITA Cap 338)")
+# ----------------------------
+# SQLite Setup (History)
+# ----------------------------
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS income_tax_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT,
+            taxpayer_type TEXT,
+            year INTEGER,
+            period TEXT,
+            revenue REAL,
+            cogs REAL,
+            opex REAL,
+            other_income REAL,
+            other_expenses REAL,
+            pbit REAL,
+            capital_allowances REAL,
+            exemptions REAL,
+            taxable_income REAL,
+            gross_tax REAL,
+            credits_wht REAL,
+            credits_foreign REAL,
+            rebates REAL,
+            net_tax_payable REAL,
+            metadata_json TEXT,
+            created_at TEXT
+        );
+        """)
+init_db()
 
+def save_history(row: dict):
+    with sqlite3.connect(DB_PATH) as conn:
+        cols = ",".join(row.keys())
+        placeholders = ",".join(["?"] * len(row))
+        conn.execute(f"INSERT INTO income_tax_history ({cols}) VALUES ({placeholders})", list(row.values()))
+        conn.commit()
+
+def load_history(client_filter: str = "") -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql_query("SELECT * FROM income_tax_history ORDER BY year DESC, created_at DESC", conn)
+    if client_filter and not df.empty:
+        df = df[df["client_name"].str.contains(client_filter, case=False, na=False)]
+    return df
+
+# ----------------------------
+# QuickBooks SDK (Optional stub)
+# ----------------------------
+def qb_is_available():
+    try:
+        import intuitlib, quickbooks  # noqa
+        return True
+    except Exception:
+        return False
+
+def qb_env_ready():
+    required = ["QB_CLIENT_ID", "QB_CLIENT_SECRET", "QB_REDIRECT_URI", "QB_ENVIRONMENT", "QB_REALM_ID"]
+    return all(os.getenv(k) for k in required)
+
+def qb_connect_button():
+    st.subheader("🔗 QuickBooks Connection (Optional)")
+    if not qb_is_available():
+        st.info("QuickBooks SDK not installed. Install `intuit-oauth` and `python-quickbooks` to enable.")
+        return None
+    if not qb_env_ready():
+        st.warning("Set env vars QB_CLIENT_ID, QB_CLIENT_SECRET, QB_REDIRECT_URI, QB_ENVIRONMENT, QB_REALM_ID to enable OAuth2.")
+        return None
+    st.write("Environment ready ✅. (This is a simulated button for demo.)")
+    if st.button("Fetch P&L from QuickBooks (Simulated)"):
+        data = {
+            "Account": ["Income:Sales", "Income:Other Income", "COGS", "Expenses:Rent", "Expenses:Salaries"],
+            "Amount": [250_000_000, 10_000_000, 90_000_000, 30_000_000, 60_000_000],
+        }
+        df = pd.DataFrame(data)
+        st.success("Fetched P&L (simulated).")
+        st.dataframe(df)
+        return df
+    return None
+
+# ----------------------------
+# File Upload & P&L Mapping
+# ----------------------------
+def parse_financial_file(uploaded) -> pd.DataFrame:
+    try:
+        return pd.read_excel(uploaded)
+    except Exception:
+        uploaded.seek(0)
+        return pd.read_csv(uploaded)
+
+def auto_map_pl(df: pd.DataFrame) -> Tuple[float, float, float, float, float]:
+    cols = {c.lower().strip(): c for c in df.columns}
+    revenue = df[cols.get("revenue")].sum() if "revenue" in cols else 0.0
+    cogs = df[cols.get("cogs")].sum() if "cogs" in cols else 0.0
+    opex = df[cols.get("operating_expenses")].sum() if "operating_expenses" in cols else 0.0
+    other_income = df[cols.get("other_income")].sum() if "other_income" in cols else 0.0
+    other_expenses = df[cols.get("other_expenses")].sum() if "other_expenses" in cols else 0.0
+
+    if "account" in cols and "amount" in cols:
+        tmp = df[[cols["account"], cols["amount"]]].copy()
+        tmp.columns = ["Account", "Amount"]
+        revenue += tmp[tmp["Account"].str.contains("income|sales|revenue", case=False, na=False)]["Amount"].sum()
+        cogs += tmp[tmp["Account"].str.contains("cogs|cost of goods", case=False, na=False)]["Amount"].sum()
+        opex += tmp[tmp["Account"].str.contains("expense|utilities|rent|salary|transport|admin", case=False, na=False)]["Amount"].sum()
+        other_income += tmp[tmp["Account"].str.contains("other income|gain", case=False, na=False)]["Amount"].sum()
+        other_expenses += tmp[tmp["Account"].str.contains("other expense|loss", case=False, na=False)]["Amount"].sum()
+
+    return float(revenue), float(cogs), float(opex), float(other_income), float(other_expenses)
+
+# ----------------------------
+# Tax Computation
+# ----------------------------
+def compute_individual_tax_brackets(taxable_income: float, brackets: List[Dict]) -> float:
+    if taxable_income <= 0:
+        return 0.0
+    tax = 0.0
+    for i, b in enumerate(brackets):
+        threshold = b["threshold"]
+        rate = b["rate"]
+        fixed = b.get("fixed", 0.0)
+        next_threshold = brackets[i + 1]["threshold"] if i + 1 < len(brackets) else None
+
+        if taxable_income > threshold:
+            upper = taxable_income if next_threshold is None else min(taxable_income, next_threshold)
+            taxable_slice = max(0.0, upper - threshold)
+            tax = fixed + taxable_slice * rate
+        else:
+            break
+    return round(max(0.0, tax), 2)
+
+def compute_company_tax(taxable_income: float, company_rate: float = 0.30) -> float:
+    if taxable_income <= 0:
+        return 0.0
+    return round(taxable_income * company_rate, 2)
+
+def apply_credits_and_rebates(gross_tax: float, credits_wht: float, credits_foreign: float, rebates: float) -> float:
+    return max(0.0, gross_tax - credits_wht - credits_foreign - rebates)
+
+# ----------------------------
+# URA Form Schemas & Validation (DT-2001, DT-2002)
+# ----------------------------
+URA_SCHEMAS = {
+    "DT-2001": {  # Individual with business income
+        "fields": [
+            ("TIN", "str"), ("Taxpayer Name", "str"), ("Period", "str"),
+            ("Year", "int"), ("Business Income (UGX)", "float"),
+            ("Allowable Deductions (UGX)", "float"),
+            ("Capital Allowances (UGX)", "float"),
+            ("Exemptions (UGX)", "float"),
+            ("Taxable Income (UGX)", "float"),
+            ("Gross Tax (UGX)", "float"),
+            ("WHT Credits (UGX)", "float"),
+            ("Foreign Tax Credit (UGX)", "float"),
+            ("Rebates (UGX)", "float"),
+            ("Net Tax Payable (UGX)", "float")
+        ]
+    },
+    "DT-2002": {  # Non-individual (company)
+        "fields": [
+            ("TIN", "str"), ("Entity Name", "str"), ("Period", "str"),
+            ("Year", "int"), ("Gross Turnover (UGX)", "float"),
+            ("COGS (UGX)", "float"), ("Operating Expenses (UGX)", "float"),
+            ("Other Income (UGX)", "float"), ("Other Expenses (UGX)", "float"),
+            ("Capital Allowances (UGX)", "float"), ("Exemptions (UGX)", "float"),
+            ("Taxable Income (UGX)", "float"), ("Gross Tax (UGX)", "float"),
+            ("WHT Credits (UGX)", "float"), ("Foreign Tax Credit (UGX)", "float"),
+            ("Rebates (UGX)", "float"), ("Net Tax Payable (UGX)", "float")
+        ]
+    }
+}
+
+def validate_and_build_return(form_code: str, payload: dict) -> pd.DataFrame:
+    schema = URA_SCHEMAS[form_code]["fields"]
+    out = {}
+    for field, ftype in schema:
+        if field not in payload:
+            raise ValueError(f"Missing required field: {field}")
+        val = payload[field]
+        if ftype == "int":
+            out[field] = int(val)
+        elif ftype == "float":
+            out[field] = float(val)
+        else:
+            out[field] = str(val)
+    return pd.DataFrame([out])
+
+# ----------------------------
+# Sidebar Configuration
+# ----------------------------
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    taxpayer_type = st.selectbox("Taxpayer Type", ["company", "individual"])
+    tax_year = st.number_input("Year", min_value=2000, max_value=datetime.now().year, value=datetime.now().year, step=1)
+    period_label = st.text_input("Period label (e.g., FY2024/25)", value=f"FY{tax_year}")
+
+    st.markdown("### Individual Progressive Brackets (editable JSON)")
+    default_brackets = [
+        {"threshold": 0.0, "rate": 0.0, "fixed": 0.0},
+        {"threshold": 2_820_000.0, "rate": 0.10, "fixed": 0.0},
+        {"threshold": 4_020_000.0, "rate": 0.20, "fixed": 120_000.0},
+        {"threshold": 4_920_000.0, "rate": 0.30, "fixed": 360_000.0},
+        {"threshold": 10_000_000.0, "rate": 0.40, "fixed": 1_830_000.0},
+    ]
+    brackets_json = st.text_area("Brackets JSON", value=json.dumps(default_brackets, indent=2), height=180)
+    try:
+        individual_brackets = sorted(json.loads(brackets_json), key=lambda x: x["threshold"])
+        st.success("Brackets loaded.")
+    except Exception as e:
+        st.error(f"Invalid brackets JSON: {e}")
+        individual_brackets = default_brackets
+
+    st.markdown("### Company Rate")
+    company_rate = st.number_input("Company Income Tax Rate", min_value=0.0, max_value=1.0, value=0.30, step=0.01)
+
+# ----------------------------
+# Tabs
+# ----------------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "1) Data Import", "2) P&L Mapping", "3) Compute & Credits", "4) Dashboard", "5) Export & URA Forms"
+])
+
+# Shared session state placeholders
+if "pl_df" not in st.session_state:
+    st.session_state["pl_df"] = None
+if "mapped_values" not in st.session_state:
+    st.session_state["mapped_values"] = {}
+
+# ----------------------------
+# Tab 1: Data Import
+# ----------------------------
+with tab1:
+    st.subheader("📂 Upload Financials (CSV/XLSX) or Connect to QuickBooks")
+    qb_df = qb_connect_button()
+    uploaded = st.file_uploader("Upload P&L / Trial Balance (CSV or Excel)", type=["csv", "xlsx"])
+    df = None
+    if qb_df is not None:
+        df = qb_df
+    if uploaded:
+        up = parse_financial_file(uploaded)
+        df = up if df is None else pd.concat([df, up], ignore_index=True)
+    if df is not None and not df.empty:
+        st.session_state["pl_df"] = df
+        st.write("### Preview (first 100 rows)")
+        st.dataframe(df.head(100))
+    else:
+        st.info("Upload a file or use QuickBooks (simulated) to proceed.")
+
+# ----------------------------
+# Tab 2: P&L Mapping
+# ----------------------------
+with tab2:
+    st.subheader("🧭 Map P&L → Revenue / COGS / OPEX / Other")
+    if st.session_state["pl_df"] is None:
+        st.warning("No data found. Go to 'Data Import' first or manually enter P&L below.")
+    else:
+        df = st.session_state["pl_df"].copy()
+        st.write("Auto-detect common columns (Account/Amount) or provide manual values.")
+        if st.button("Auto-Map P&L from uploaded file"):
+            revenue, cogs, opex, other_income, other_expenses = auto_map_pl(df)
+            st.session_state["mapped_values"] = {
+                "revenue": revenue, "cogs": cogs, "opex": opex,
+                "other_income": other_income, "other_expenses": other_expenses
+            }
+            st.success("Auto-mapping complete (you can override the values).")
+
+    mv = st.session_state.get("mapped_values", {})
+    st.markdown("#### Manual / Override entries")
+    revenue = st.number_input("Revenue (UGX)", min_value=0.0, value=float(mv.get("revenue", 0.0)), step=1000.0, format="%.2f")
+    cogs = st.number_input("COGS (UGX)", min_value=0.0, value=float(mv.get("cogs", 0.0)), step=1000.0, format="%.2f")
+    opex = st.number_input("Operating Expenses (UGX)", min_value=0.0, value=float(mv.get("opex", 0.0)), step=1000.0, format="%.2f")
+    other_income = st.number_input("Other Income (UGX)", min_value=0.0, value=float(mv.get("other_income", 0.0)), step=1000.0, format="%.2f")
+    other_expenses = st.number_input("Other Expenses (UGX)", min_value=0.0, value=float(mv.get("other_expenses", 0.0)), step=1000.0, format="%.2f")
+
+    st.session_state["mapped_values"] = {
+        "revenue": revenue, "cogs": cogs, "opex": opex,
+        "other_income": other_income, "other_expenses": other_expenses
+    }
+    pbit_manual = (revenue + other_income) - (cogs + opex + other_expenses)
+    st.metric("Derived Profit / (Loss) Before Allowances (PBIT)", f"UGX {pbit_manual:,.2f}")
+
+# ----------------------------
+# Tab 3: Compute & Credits (with full Addbacks & Allowables)
+# ----------------------------
+with tab3:
+    st.subheader("🧮 Compute Tax, Apply Credits & Exemptions")
+
+    client_name = st.text_input("Client Name", value="Acme Ltd")
+    tin = st.text_input("TIN (optional)")
+
+    mv = st.session_state.get("mapped_values", {})
+    revenue = mv.get("revenue", 0.0)
+    cogs = mv.get("cogs", 0.0)
+    opex = mv.get("opex", 0.0)
+    other_income = mv.get("other_income", 0.0)
+    other_expenses = mv.get("other_expenses", 0.0)
+    pbit = (revenue + other_income) - (cogs + opex + other_expenses)
+
+    st.markdown("### P&L summary")
+    st.write(pd.DataFrame([{
+        "Revenue": revenue, "COGS": cogs, "OPEX": opex,
+        "Other Income": other_income, "Other Expenses": other_expenses,
+        "PBIT": pbit
+    }]).T)
+
+    # --- Addbacks (Disallowables) — use the full list provided, displayed in an expander
+    addbacks_labels = [
+        "Depreciation (Section 22(3)(b))","Amortisation","Redundancy",
+        "Domestic/Private Expenditure (Section 22(3)(a))",
+        "Capital Gain (Sections 22(1)(b), 47, 48)","Rental Income Loss (Section 22(1)(c))",
+        "Expenses Exceeding 50% of Rental Income (Section 22(2))",
+        "Capital Nature Expenditure (Section 22(3)(b))","Recoverable Expenditure (Section 22(3)(c))",
+        "Income Tax Paid Abroad (Section 22(3)(d))","Capitalised Income (Section 22(3)(e))",
+        "Gift Cost not in Recipient Income (Section 22(3)(f))","Fines or Penalties (Section 22(3)(g))",
+        "Employee Retirement Contributions (Section 22(3)(h))","Life Insurance Premiums (Section 22(3)(i))",
+        "Pension Payments (Section 22(3)(j))","Alimony / Allowance (Section 22(3)(k))",
+        "Suppliers without TIN > UGX5M (Section 22(3)(l))","EFRIS Suppliers w/o e-invoices (Section 22(3)(m))",
+        "Debt Obligation Principal (Section 25)","Interest on Capital Assets (Sections 22(3) & 50(2))",
+        "Interest on Fixed Capital (Section 25(1))","Bad Debts Recovered (Section 61)",
+        "General Provision for Bad Debts (Section 24)","Entertainment Income (Section 23)",
+        "Meal & Refreshment Expenses (Section 23)","Charitable Donations to Non-Exempt Orgs (Section 33(1))",
+        "Charitable Donations >5% Chargeable Income (Section 33(3))","Legal Fees",
+        "Legal Expenses - Capital Items (Section 50)","Legal Expenses - New Trade Rights",
+        "Legal Expenses - Breach of Law","Cost of Breach of Contract - Capital Account",
+        "Legal Expenses on Breach of Contract - Capital Account","Legal Expenses on Loan Renewals - Non-commercial",
+        "Bad Debts by Senior Employee/Management","General Provisions Bad Debts (FI Credit Classification)",
+        "Loss on Sale of Fixed Assets (Section 22(3)(b))","Loss on Other Capital Items (Section 22(3)(b))",
+        "Expenditure on Share Capital Increase (Section 22(3)(b))","Dividends Paid (Section 22(3)(d))",
+        "Provision for Bad Debts (Non-Financial Institutions) (Section 24)",
+        "Increase in Provision for Bad Debts (Section 24)","Debt Collection Expenses related to Capital Expenditure",
+        "Foreign Currency Debt Gains (Section 46(2))","Costs incidental to Capital Asset (Stamp Duty, Section 50)",
+        "Non-Business Expenses (Section 22)","Miscellaneous Staff Costs",
+        "Staff Costs - Commuting (Section 22(4)(b))","First Time Work Permits",
+        "Unrealised Foreign Exchange Losses (Section 46(3))","Foreign Currency Debt Losses (Section 46)",
+        "Education Expenditure (Non Section 32)","Donations (Non Section 33)",
+        "Decommissioning Expenditure by Licensee (Section 99(2))","Telephone Costs (10%)",
+        "Revaluation Loss","Interest Expense on Treasury Bills (Section 139(e))",
+        "Burial Expenses (Section 22(3)(b))","Subscription (Section 22(3)(a))",
+        "Interest on Directors Debit Balances (Section 22(3)(a))","Entertainment Expenses (Section 23)",
+        "Gifts (Section 22(3)(f))","Dividends Paid (duplicate)","Income Carried to Reserve Fund (Section 22(3)(e))",
+        "Impairment Losses on Loans and Advances","Interest Expense on Treasury Bonds (Section 139(e))",
+        "Staff Leave Provisions (Section 22(4)(b))","Increase in Gratuity","Balancing Charge (Sections 27(5) & 18(1))"
+    ]
+
+    addbacks = {}
+    with st.expander("Show / Enter Addbacks (Disallowable Expenses) — full list", expanded=False):
+        for label in addbacks_labels:
+            key = f"addback__{label}"
+            addbacks[label] = st.number_input(label, min_value=0.0, value=float(st.session_state.get(key, 0.0)), format="%.2f", key=key)
+
+    total_addbacks = sum(addbacks.values())
+    adjusted_profit = pbit + total_addbacks
+    st.markdown(f"### Adjusted Profit (PBIT + Addbacks): UGX {adjusted_profit:,.2f}")
+
+    # --- Allowables (Deductions) — full list
+    allowables_labels = [
+        "Wear & Tear (Section 27(1))","Industrial Building Allowance (5% for 20 years) (Section 28(1))",
+        "Startup Costs (25%) (Section 28)","Reverse VAT (Section 22(1)(a))",
+        "Listing Business with Uganda Stock Exchange (Section 29(2)(a))",
+        "Registration Fees, Accountant Fees, Legal Fees, Advertising, Training (Section 29(2)(b))",
+        "Expenses in Acquiring Intangible Asset (Section 30(1))","Disposal of Intangible Asset (Section 30(2))",
+        "Minor Capital Expenditure (Minor Capex) (Section 26(2))","Revenue Expenditures - Repairs & Maintenance (Section 26)",
+        "Expenditure on Scientific Research (Section 31(1))","Expenditure on Training (Education) (Section 32(1))",
+        "Charitable Donations to Exempt Organisations (Section 33(1))","Charitable Donations Up to 5% Chargeable Income (Section 33(3))",
+        "Expenditure on Farming (Section 34)","Apportionment of Deductions (Section 35)",
+        "Carry Forward Losses from Previous Period (Section 36(1))","Carry Forward Losses Upto 50% after 7 Years (Section 36(6))",
+        "Disposal of Trading Stock (Section 44(1))","Foreign Currency Debt Loss (Realised Exchange Loss) (Section 46(3))",
+        "Loss on Disposal of Asset (Section 48)","Exclusion of Doctrine Mutuality (Section 59(3))",
+        "Partnership Loss for Resident Partner (Section 66(3))","Partnership Loss for Non-Resident Partner (Section 66(4))",
+        "Expenditure or Loss by Trustee Beneficiary (Section 71(5))","Expenditure or Loss by Beneficiary of Deceased Estate (Section 72(2))",
+        "Limitation on Deduction for Petroleum Operations (Section 91(1))","Decommission Costs & Expenditures - Petroleum (Section 99(2))",
+        "Unrealised Gains (Section 46)","Impairment of Asset","Decrease in Provision for Bad Debts (Section 24)",
+        "Bad Debts Written Off (Section 24)","Staff Costs - Business Travel (Section 22)",
+        "Private Employer Disability Tax (Section 22(1)(e))","Rental Income Expenditure & Losses (Section 22(1)(c)(2))",
+        "Local Service Tax (Section 22(1)(d))","Interest Income on Treasury Bills (Section 139(a))",
+        "Interest on Circulating Capital","Interest Income on Treasury Bonds (Section 139(a))",
+        "Specific Provisions for Bad Debts (Financial Institutions)","Revaluation Gains (Financial Institutions)",
+        "Rental Income (Section 5(3)(a))","Interest Income from Treasury Bills (Section 139(a)(c)(d))",
+        "Interest Income from Treasury Bonds (Section 139(a)(c)(d))","Legal Expenses on Breach of Contract to Revenue Account",
+        "Legal Expenses on Maintenance of Capital Assets","Legal Expenses on Existing Trade Rights",
+        "Legal Expenses Incidental to Revenue Items","Legal Expenses on Debt Collection - Trade Debts",
+        "Closing Tax Written Down Value < UGX1M (Section 27(6))","Intangible Assets",
+        "Legal Expenses for Renewal of Loans (Financial Institutions)","Interest on Debt Obligation (Loan) (Section 25(1))",
+        "Interest on Debt Obligation by Group Member (30% EBITDA) (Section 25(3))","Gains & Losses on Disposal of Assets (Section 22(1)(b))",
+        "Balancing Allowance (Sections 27(7))"
+    ]
+
+    allowables = {}
+    with st.expander("Show / Enter Allowables (Deductions) — full list", expanded=False):
+        for label in allowables_labels:
+            key = f"allowable__{label}"
+            allowables[label] = st.number_input(label, min_value=0.0, value=float(st.session_state.get(key, 0.0)), format="%.2f", key=key)
+
+    total_allowables = sum(allowables.values())
+    chargeable_income = max(0.0, adjusted_profit - total_allowables)
+    st.markdown(f"### Chargeable Income (after allowables): UGX {chargeable_income:,.2f}")
+
+    # --- Credits, allowances and adjustments
+    st.markdown("### Credits, Capital Allowances & Rebates")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        capital_allowances = st.number_input("Capital Allowances (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        exemptions = st.number_input("Exemptions (UGX)", min_value=0.0, value=0.0, format="%.2f")
+    with col2:
+        credits_wht = st.number_input("WHT Credits (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        credits_foreign = st.number_input("Foreign Tax Credit (UGX)", min_value=0.0, value=0.0, format="%.2f")
+    with col3:
+        rebates = st.number_input("Rebates (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        provisional_tax_paid = st.number_input("Provisional Tax Paid (UGX)", min_value=0.0, value=0.0, format="%.2f")
+
+    # Adjust taxable income by capital allowances & exemptions (policy: we recompute on adjusted taxable)
+    adjusted_taxable_income = max(0.0, chargeable_income - capital_allowances - exemptions)
+    if taxpayer_type.lower() == "company":
+        gross_tax = compute_company_tax(adjusted_taxable_income, company_rate=company_rate)
+    else:
+        gross_tax = compute_individual_tax_brackets(adjusted_taxable_income, individual_brackets)
+
+    net_tax_payable = apply_credits_and_rebates(gross_tax, credits_wht, credits_foreign, rebates)
+    net_tax_after_provisional = max(0.0, net_tax_payable - provisional_tax_paid)
+
+    st.metric("Taxable Income (after capital allowances & exemptions)", f"UGX {adjusted_taxable_income:,.2f}")
+    st.metric("Gross Tax (before credits)", f"UGX {gross_tax:,.2f}")
+    st.metric("Net Tax Payable (after credits & rebates)", f"UGX {net_tax_payable:,.2f}")
+    st.metric("Net Tax Payable (after provisional payments)", f"UGX {net_tax_after_provisional:,.2f}")
+
+    if st.button("💾 Save Computation to History"):
+        row = {
+            "client_name": client_name,
+            "taxpayer_type": taxpayer_type,
+            "year": int(tax_year),
+            "period": period_label,
+            "revenue": revenue, "cogs": cogs, "opex": opex,
+            "other_income": other_income, "other_expenses": other_expenses,
+            "pbit": pbit,
+            "capital_allowances": capital_allowances, "exemptions": exemptions,
+            "taxable_income": adjusted_taxable_income, "gross_tax": gross_tax,
+            "credits_wht": credits_wht, "credits_foreign": credits_foreign,
+            "rebates": rebates, "net_tax_payable": net_tax_after_provisional,
+            "metadata_json": json.dumps({"TIN": tin}),
+            "created_at": datetime.utcnow().isoformat()
+        }
+        save_history(row)
+        st.success("Saved to history.")
+
+# ----------------------------
+# Tab 4: Dashboard
+# ----------------------------
+with tab4:
+    st.subheader("📊 Multi-Year History Dashboard")
+    client_filter = st.text_input("Filter by client name (optional)", "")
+    hist = load_history(client_filter)
+    if hist.empty:
+        st.info("No saved history yet.")
+    else:
+        st.dataframe(hist.head(200))
+        st.markdown("#### Net Tax by Year")
+        pivot = hist.groupby(["year"])["net_tax_payable"].sum().reset_index()
+        st.line_chart(pivot.rename(columns={"net_tax_payable": "Net Tax Payable"}).set_index("year"))
+        st.markdown("#### Taxable Income vs Gross Tax (latest 30)")
+        st.bar_chart(hist.head(30).set_index("created_at")[["taxable_income", "gross_tax"]])
+
+# ----------------------------
+# Tab 5: Export & URA Forms
+# ----------------------------
+with tab5:
+    st.subheader("📤 URA Return CSV / Excel (DT-2001 / DT-2002) with Validation")
+    latest = load_history().head(1)
+    suggested_client = latest["client_name"].iloc[0] if not latest.empty else ""
+    suggested_year = int(latest["year"].iloc[0]) if not latest.empty else tax_year
+    suggested_period = latest["period"].iloc[0] if not latest.empty else period_label
+    suggested_net_tax = float(latest["net_tax_payable"].iloc[0]) if not latest.empty else 0.0
+    suggested_taxable = float(latest["taxable_income"].iloc[0]) if not latest.empty else 0.0
+    suggested_gross = float(latest["gross_tax"].iloc[0]) if not latest.empty else 0.0
+
+    st.markdown("Fill the required fields to build a URA-compliant CSV/Excel.")
+    form_code = "DT-2002" if taxpayer_type.lower() == "company" else "DT-2001"
+    st.info(f"Selected Form: **{form_code}**")
+
+    TIN_input = st.text_input("TIN (required)", value=json.loads(latest["metadata_json"].iloc[0])["TIN"] if not latest.empty and latest["metadata_json"].iloc[0] else "")
+
+    if form_code == "DT-2001":
+        taxpayer_name = st.text_input("Taxpayer Name", value=suggested_client)
+        business_income = st.number_input("Business Income (UGX)", min_value=0.0, value=suggested_taxable, format="%.2f")
+        allowable_deductions = st.number_input("Allowable Deductions (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        capital_allowances_f = st.number_input("Capital Allowances (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        exemptions_f = st.number_input("Exemptions (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        gross_tax_f = st.number_input("Gross Tax (UGX)", min_value=0.0, value=suggested_gross, format="%.2f")
+        wht_f = st.number_input("WHT Credits (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        foreign_f = st.number_input("Foreign Tax Credit (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        rebates_f = st.number_input("Rebates (UGX)", min_value=0.0, value=0.0, format="%.2f")
+
+        payload = {
+            "TIN": TIN_input,
+            "Taxpayer Name": taxpayer_name,
+            "Period": suggested_period,
+            "Year": suggested_year,
+            "Business Income (UGX)": business_income,
+            "Allowable Deductions (UGX)": allowable_deductions,
+            "Capital Allowances (UGX)": capital_allowances_f,
+            "Exemptions (UGX)": exemptions_f,
+            "Taxable Income (UGX)": max(0.0, business_income - allowable_deductions - capital_allowances_f - exemptions_f),
+            "Gross Tax (UGX)": gross_tax_f,
+            "WHT Credits (UGX)": wht_f,
+            "Foreign Tax Credit (UGX)": foreign_f,
+            "Rebates (UGX)": rebates_f,
+            "Net Tax Payable (UGX)": max(0.0, gross_tax_f - wht_f - foreign_f - rebates_f)
+        }
+
+    else:  # DT-2002
+        entity_name = st.text_input("Entity Name", value=suggested_client)
+        gross_turnover = st.number_input("Gross Turnover (UGX)", min_value=0.0, value=float(latest["revenue"].iloc[0]) if not latest.empty else 0.0, format="%.2f")
+        cogs_f = st.number_input("COGS (UGX)", min_value=0.0, value=float(latest["cogs"].iloc[0]) if not latest.empty else 0.0, format="%.2f")
+        opex_f = st.number_input("Operating Expenses (UGX)", min_value=0.0, value=float(latest["opex"].iloc[0]) if not latest.empty else 0.0, format="%.2f")
+        other_income_f = st.number_input("Other Income (UGX)", min_value=0.0, value=float(latest["other_income"].iloc[0]) if not latest.empty else 0.0, format="%.2f")
+        other_expenses_f = st.number_input("Other Expenses (UGX)", min_value=0.0, value=float(latest["other_expenses"].iloc[0]) if not latest.empty else 0.0, format="%.2f")
+        capital_allowances_f = st.number_input("Capital Allowances (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        exemptions_f = st.number_input("Exemptions (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        gross_tax_f = st.number_input("Gross Tax (UGX)", min_value=0.0, value=suggested_gross, format="%.2f")
+        wht_f = st.number_input("WHT Credits (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        foreign_f = st.number_input("Foreign Tax Credit (UGX)", min_value=0.0, value=0.0, format="%.2f")
+        rebates_f = st.number_input("Rebates (UGX)", min_value=0.0, value=0.0, format="%.2f")
+
+        taxable_income_calc = max(0.0, (gross_turnover + other_income_f) - (cogs_f + opex_f + other_expenses_f) - capital_allowances_f - exemptions_f)
+        payload = {
+            "TIN": TIN_input,
+            "Entity Name": entity_name,
+            "Period": suggested_period,
+            "Year": suggested_year,
+            "Gross Turnover (UGX)": gross_turnover,
+            "COGS (UGX)": cogs_f,
+            "Operating Expenses (UGX)": opex_f,
+            "Other Income (UGX)": other_income_f,
+            "Other Expenses (UGX)": other_expenses_f,
+            "Capital Allowances (UGX)": capital_allowances_f,
+            "Exemptions (UGX)": exemptions_f,
+            "Taxable Income (UGX)": taxable_income_calc,
+            "Gross Tax (UGX)": gross_tax_f,
+            "WHT Credits (UGX)": wht_f,
+            "Foreign Tax Credit (UGX)": foreign_f,
+            "Rebates (UGX)": rebates_f,
+            "Net Tax Payable (UGX)": max(0.0, gross_tax_f - wht_f - foreign_f - rebates_f)
+        }
+
+    if st.button("✅ Validate & Build CSV / Excel"):
+        try:
+            df_return = validate_and_build_return(form_code, payload)
+            st.success("Validation passed. Download your URA return below.")
+            csv_bytes = df_return.to_csv(index=False).encode("utf-8")
+            st.download_button(label="📥 Download URA Return CSV", data=csv_bytes, file_name=f"{form_code}_{payload.get('Year')}_{payload.get('TIN','')}.csv", mime="text/csv")
+            # Excel
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+                df_return.to_excel(writer, index=False, sheet_name=form_code)
+                writer.save()
+            st.download_button(label="📥 Download URA Return Excel", data=buffer.getvalue(), file_name=f"{form_code}_{payload.get('Year')}_{payload.get('TIN','')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.dataframe(df_return)
+        except Exception as e:
+            st.error(f"Validation failed: {e}")
+
+# ----------------------------
+# Footer Notes
+# ----------------------------
+st.markdown("---")
 st.markdown("""
-This application computes Business Income Tax payable or claimable based on Uganda's Income Tax Act Cap 338.
-Please input all amounts in Ugandan Shillings (UGX).
+**Notes & Next Steps**
+- Brackets in the sidebar are editable — make sure these match the official URA schedule for the relevant year.
+- QuickBooks integration is a stub here. For production, implement OAuth2 callback endpoints and token persistence; then call the QuickBooks Reports API (ProfitAndLoss).
+- URA schemas here are minimal; extend them to include all required URA fields, field lengths, and validation rules.
+- Add authentication, role-based access, and secure storage before using in production.
+- This tool is designed to speed internal computations and should not replace professional tax advice or formal URA filing procedures.
 """)
 
-# SECTION 1: Basic Info
-st.header("1. Basic Information & Profit Before Income Tax (PBIT)")
-title = st.text_input("Business/Company Name or Title", max_chars=100)
-pbit = st.number_input("Profit Before Income Tax (PBIT)", min_value=0.0, format="%.2f")
-
-# SECTION 2: Addbacks / Disallowables (Disallowable Expenses)
-st.header("2. Addbacks / Disallowables (Add to PBIT)")
-st.markdown("Referencing ITA Cap 338 Sections")
-
-addbacks = {}
-
-addbacks['Depreciation (Section 22(3)(b))'] = st.number_input("1. Depreciation", min_value=0.0, format="%.2f")
-addbacks['Amortisation'] = st.number_input("2. Amortisation", min_value=0.0, format="%.2f")
-addbacks['Redundancy'] = st.number_input("3. Redundancy", min_value=0.0, format="%.2f")
-addbacks['Domestic/Private Expenditure (Section 22(3)(a))'] = st.number_input("4. Expenditure or Loss of Domestic or Private Nature", min_value=0.0, format="%.2f")
-addbacks['Capital Gain (Sections 22(1)(b), 47, 48)'] = st.number_input("5. Gains and Losses on Disposal of Business Assets (Capital Gain)", min_value=0.0, format="%.2f")
-addbacks['Rental Income Loss (Section 22(1)(c))'] = st.number_input("6. Expenditure or Loss in the case of Rental Income", min_value=0.0, format="%.2f")
-addbacks['Expenses Exceeding 50% of Rental Income (Section 22(2))'] = st.number_input("7. Expenses Exceeding 50% of Rental Income", min_value=0.0, format="%.2f")
-addbacks['Capital Nature Expenditure (Section 22(3)(b))'] = st.number_input("8. Expenditure or Loss of Capital Nature / Cost Base of Asset", min_value=0.0, format="%.2f")
-addbacks['Recoverable Expenditure (Section 22(3)(c))'] = st.number_input("9. Expenditure or Loss Recoverable Under Insurance, Contract, Indemnity", min_value=0.0, format="%.2f")
-addbacks['Income Tax Paid Abroad (Section 22(3)(d))'] = st.number_input("10. Income Tax Payable in Uganda or Abroad", min_value=0.0, format="%.2f")
-addbacks['Capitalised Income (Section 22(3)(e))'] = st.number_input("11. Income Carried to Reserve Fund or Capitalised", min_value=0.0, format="%.2f")
-addbacks['Gift Cost not in Recipient Income (Section 22(3)(f))'] = st.number_input("12. Cost of Gift to Individual not in Recipient’s Gross Income", min_value=0.0, format="%.2f")
-addbacks['Fines or Penalties (Section 22(3)(g))'] = st.number_input("13. Fine or Penalty Paid to Government or Authority", min_value=0.0, format="%.2f")
-addbacks['Employee Retirement Contributions (Section 22(3)(h))'] = st.number_input("14. Employee's Retirement Fund Contributions", min_value=0.0, format="%.2f")
-addbacks['Life Insurance Premiums (Section 22(3)(i))'] = st.number_input("15. Life Insurance Premiums", min_value=0.0, format="%.2f")
-addbacks['Pension Payments (Section 22(3)(j))'] = st.number_input("16. Pension Payments Made to Any Person", min_value=0.0, format="%.2f")
-addbacks['Alimony / Allowance (Section 22(3)(k))'] = st.number_input("17. Alimony/Allowance under Judicial Order", min_value=0.0, format="%.2f")
-addbacks['Suppliers without TIN > UGX5M (Section 22(3)(l))'] = st.number_input("18. Expenditure Above UGX 5M from Suppliers Without TIN", min_value=0.0, format="%.2f")
-addbacks['EFRIS Suppliers w/o e-invoices (Section 22(3)(m))'] = st.number_input("19. Expenses from EFRIS-designated Suppliers Not Supported by e-invoices/e-receipts", min_value=0.0, format="%.2f")
-addbacks['Debt Obligation Principal (Section 25)'] = st.number_input("20. Debt Obligation (Principal Loan Amount)", min_value=0.0, format="%.2f")
-addbacks['Interest on Capital Assets (Sections 22(3) & 50(2))'] = st.number_input("21. Interest Paid on Capital Assets (Included in Cost Base)", min_value=0.0, format="%.2f")
-addbacks['Interest on Fixed Capital (Section 25(1))'] = st.number_input("22. Interest on Fixed Capital", min_value=0.0, format="%.2f")
-addbacks['Bad Debts Recovered (Section 61)'] = st.number_input("23. Bad Debts Recovered (Recouped Expenditure)", min_value=0.0, format="%.2f")
-addbacks['General Provision for Bad Debts (Section 24)'] = st.number_input("24. General Provision for Bad Debts Not Included in Gross Income", min_value=0.0, format="%.2f")
-addbacks['Entertainment Income (Section 23)'] = st.number_input("25. Entertainment Income", min_value=0.0, format="%.2f")
-addbacks['Meal & Refreshment Expenses (Section 23)'] = st.number_input("26. Expenses on Meals and Refreshments", min_value=0.0, format="%.2f")
-addbacks['Charitable Donations to Non-Exempt Orgs (Section 33(1))'] = st.number_input("27. Charitable Donations to Non-Exempt Organisation", min_value=0.0, format="%.2f")
-addbacks['Charitable Donations >5% Chargeable Income (Section 33(3))'] = st.number_input("28. Charitable Donations in Excess of 5% Chargeable Income", min_value=0.0, format="%.2f")
-addbacks['Legal Fees'] = st.number_input("29. Legal Fees", min_value=0.0, format="%.2f")
-addbacks['Legal Expenses - Capital Items (Section 50)'] = st.number_input("30. Legal Expenses Incidental to Capital Items", min_value=0.0, format="%.2f")
-addbacks['Legal Expenses - New Trade Rights'] = st.number_input("31. Legal Expenses to Acquire New or Future Trade Rights", min_value=0.0, format="%.2f")
-addbacks['Legal Expenses - Breach of Law'] = st.number_input("32. Legal Expenses on Breach of Law", min_value=0.0, format="%.2f")
-addbacks['Cost of Breach of Contract - Capital Account'] = st.number_input("33. Cost of Breach of Contract on Capital Account", min_value=0.0, format="%.2f")
-addbacks['Legal Expenses on Breach of Contract - Capital Account'] = st.number_input("34. Legal Expenses on Breach of Contract in relation to Capital Account", min_value=0.0, format="%.2f")
-addbacks['Legal Expenses on Loan Renewals - Non-commercial'] = st.number_input("35. Legal Expenses on Renewal of Loans (Ordinary/Non-Commercial)", min_value=0.0, format="%.2f")
-addbacks['Bad Debts by Senior Employee/Management'] = st.number_input("36. Bad Debts Incurred by Senior Employee or Management", min_value=0.0, format="%.2f")
-addbacks['General Provisions Bad Debts (FI Credit Classification)'] = st.number_input("37. General Provisions of Bad Debts (Financial Institutions)", min_value=0.0, format="%.2f")
-addbacks['Loss on Sale of Fixed Assets (Section 22(3)(b))'] = st.number_input("38. Loss on Sale of Fixed Assets", min_value=0.0, format="%.2f")
-addbacks['Loss on Other Capital Items (Section 22(3)(b))'] = st.number_input("39. Loss on Other Capital Items", min_value=0.0, format="%.2f")
-addbacks['Expenditure on Share Capital Increase (Section 22(3)(b))'] = st.number_input("40. Expenditure on Increase in Share Capital", min_value=0.0, format="%.2f")
-addbacks['Dividends Paid (Section 22(3)(d))'] = st.number_input("41. Dividends Paid", min_value=0.0, format="%.2f")
-addbacks['Provision for Bad Debts (Non-Financial Institutions) (Section 24)'] = st.number_input("42. Provision for Bad Debts Not for Financial Institutions", min_value=0.0, format="%.2f")
-addbacks['Increase in Provision for Bad Debts (Section 24)'] = st.number_input("43. Increase in Provision for Bad Debts", min_value=0.0, format="%.2f")
-addbacks['Debt Collection Expenses related to Capital Expenditure'] = st.number_input("44. Debt Collection Expenses in relation to Capital Expenditure", min_value=0.0, format="%.2f")
-addbacks['Foreign Currency Debt Gains (Section 46(2))'] = st.number_input("45. Foreign Currency Debt Gains (Realised Gain)", min_value=0.0, format="%.2f")
-addbacks['Costs incidental to Capital Asset (Stamp Duty, Section 50)'] = st.number_input("46. Costs Incidental to Cost Base of Capital Asset", min_value=0.0, format="%.2f")
-addbacks['Non-Business Expenses (Section 22)'] = st.number_input("47. Non-Business Expenses", min_value=0.0, format="%.2f")
-addbacks['Miscellaneous Staff Costs'] = st.number_input("48. Miscellaneous Staff Costs", min_value=0.0, format="%.2f")
-addbacks['Staff Costs - Commuting (Section 22(4)(b))'] = st.number_input("49. Staff Costs (Transport Commuting from Home to Work)", min_value=0.0, format="%.2f")
-addbacks['First Time Work Permits'] = st.number_input("50. First Time Work Permits", min_value=0.0, format="%.2f")
-addbacks['Unrealised Foreign Exchange Losses (Section 46(3))'] = st.number_input("51. Unrealised Foreign Exchange Losses", min_value=0.0, format="%.2f")
-addbacks['Foreign Currency Debt Losses (Section 46)'] = st.number_input("52. Foreign Currency Debt Losses", min_value=0.0, format="%.2f")
-addbacks['Education Expenditure (Non Section 32)'] = st.number_input("53. Expenditure on Education", min_value=0.0, format="%.2f")
-addbacks['Donations (Non Section 33)'] = st.number_input("54. Donations", min_value=0.0, format="%.2f")
-addbacks['Decommissioning Expenditure by Licensee (Section 99(2))'] = st.number_input("55. Decommissioning Expenditure by Licensee", min_value=0.0, format="%.2f")
-addbacks['Telephone Costs (10%)'] = st.number_input("56. Telephone Costs (10%)", min_value=0.0, format="%.2f")
-addbacks['Revaluation Loss'] = st.number_input("57. Revaluation Loss", min_value=0.0, format="%.2f")
-addbacks['Interest Expense on Treasury Bills (Section 139(e))'] = st.number_input("58. Interest Expense on Treasury Bills", min_value=0.0, format="%.2f")
-addbacks['Burial Expenses (Section 22(3)(b))'] = st.number_input("59. Burial Expenses", min_value=0.0, format="%.2f")
-addbacks['Subscription (Section 22(3)(a))'] = st.number_input("60. Subscription", min_value=0.0, format="%.2f")
-addbacks['Interest on Directors Debit Balances (Section 22(3)(a))'] = st.number_input("61. Interest on Directors’ Debit Balances", min_value=0.0, format="%.2f")
-addbacks['Entertainment Expenses (Section 23)'] = st.number_input("62. Entertainment Expenses", min_value=0.0, format="%.2f")
-addbacks['Gifts (Section 22(3)(f))'] = st.number_input("63. Gifts", min_value=0.0, format="%.2f")
-addbacks['Dividends Paid (Section 22(3)(d))'] = st.number_input("64. Dividends Paid (duplicate)", min_value=0.0, format="%.2f")
-addbacks['Income Carried to Reserve Fund (Section 22(3)(e))'] = st.number_input("65. Income Carried to Reserve Fund", min_value=0.0, format="%.2f")
-addbacks['Impairment Losses on Loans and Advances'] = st.number_input("66. Impairment Losses on Loans and Advances", min_value=0.0, format="%.2f")
-addbacks['Interest Expense on Treasury Bonds (Section 139(e))'] = st.number_input("67. Interest Expense on Treasury Bonds", min_value=0.0, format="%.2f")
-addbacks['Staff Leave Provisions (Section 22(4)(b))'] = st.number_input("68. Staff Leave Provisions", min_value=0.0, format="%.2f")
-addbacks['Increase in Gratuity'] = st.number_input("69. Increase in Gratuity", min_value=0.0, format="%.2f")
-addbacks['Balancing Charge (Sections 27(5) & 18(1))'] = st.number_input("70. Balancing Charge", min_value=0.0, format="%.2f")
-
-# SECTION 3: Calculate Adjusted Profit
-adjusted_profit = pbit + sum(addbacks.values())
-
-st.markdown(f"### Adjusted Profit: UGX {adjusted_profit:,.2f}")
-
-# SECTION 4: Allowables / Deductions
-st.header("3. Allowables / Deductions (Subtract from Adjusted Profit)")
-allowables = {}
-
-allowables['Wear & Tear (Section 27(1))'] = st.number_input("1. Wear & Tear", min_value=0.0, format="%.2f")
-allowables['Industrial Building Allowance (5% for 20 years) (Section 28(1))'] = st.number_input("2. Industrial Building Allowance", min_value=0.0, format="%.2f")
-allowables['Startup Costs (25%) (Section 28)'] = st.number_input("3. Startup Costs (25%)", min_value=0.0, format="%.2f")
-allowables['Reverse VAT (Section 22(1)(a))'] = st.number_input("4. Reverse VAT", min_value=0.0, format="%.2f")
-allowables['Listing Business with Uganda Stock Exchange (Section 29(2)(a))'] = st.number_input("5. Listing Business with Uganda Stock Exchange", min_value=0.0, format="%.2f")
-allowables['Registration Fees, Accountant Fees, Legal Fees, Advertising, Training (Section 29(2)(b))'] = st.number_input("6. Registration, Accountant, Legal, Advertising, Training Fees", min_value=0.0, format="%.2f")
-allowables['Expenses in Acquiring Intangible Asset (Section 30(1))'] = st.number_input("7. Expenses in Acquiring Intangible Asset", min_value=0.0, format="%.2f")
-allowables['Disposal of Intangible Asset (Section 30(2))'] = st.number_input("8. Disposal of Intangible Asset", min_value=0.0, format="%.2f")
-allowables['Minor Capital Expenditure (Minor Capex) (Section 26(2))'] = st.number_input("9. Minor Capital Expenditure (Minor Capex)", min_value=0.0, format="%.2f")
-allowables['Revenue Expenditures - Repairs & Maintenance (Section 26)'] = st.number_input("10. Revenue Expenditures (Repairs & Maintenance)", min_value=0.0, format="%.2f")
-allowables['Expenditure on Scientific Research (Section 31(1))'] = st.number_input("11. Expenditure on Scientific Research", min_value=0.0, format="%.2f")
-allowables['Expenditure on Training (Education) (Section 32(1))'] = st.number_input("12. Expenditure on Training (Education)", min_value=0.0, format="%.2f")
-allowables['Charitable Donations to Exempt Organisations (Section 33(1))'] = st.number_input("13. Charitable Donations to Exempt Organisations", min_value=0.0, format="%.2f")
-allowables['Charitable Donations Up to 5% Chargeable Income (Section 33(3))'] = st.number_input("14. Charitable Donations Up to 5% Chargeable Income", min_value=0.0, format="%.2f")
-allowables['Expenditure on Farming (Section 34)'] = st.number_input("15. Expenditure on Farming", min_value=0.0, format="%.2f")
-allowables['Apportionment of Deductions (Section 35)'] = st.number_input("16. Apportionment of Deductions", min_value=0.0, format="%.2f")
-allowables['Carry Forward Losses from Previous Period (Section 36(1))'] = st.number_input("17. Carry Forward Losses from Previous Period", min_value=0.0, format="%.2f")
-allowables['Carry Forward Losses Upto 50% after 7 Years (Section 36(6))'] = st.number_input("18. Carry Forward Losses Up to 50% after 7 Years", min_value=0.0, format="%.2f")
-allowables['Disposal of Trading Stock (Section 44(1))'] = st.number_input("19. Disposal of Trading Stock", min_value=0.0, format="%.2f")
-allowables['Foreign Currency Debt Loss (Realised Exchange Loss) (Section 46(3))'] = st.number_input("20. Foreign Currency Debt Loss (Realised Exchange Loss)", min_value=0.0, format="%.2f")
-allowables['Loss on Disposal of Asset (Section 48)'] = st.number_input("21. Loss on Disposal of Asset", min_value=0.0, format="%.2f")
-allowables['Exclusion of Doctrine Mutuality (Section 59(3))'] = st.number_input("22. Exclusion of Doctrine Mutuality", min_value=0.0, format="%.2f")
-allowables['Partnership Loss for Resident Partner (Section 66(3))'] = st.number_input("23. Partnership Loss for Resident Partner", min_value=0.0, format="%.2f")
-allowables['Partnership Loss for Non-Resident Partner (Section 66(4))'] = st.number_input("24. Partnership Loss for Non-Resident Partner", min_value=0.0, format="%.2f")
-allowables['Expenditure or Loss by Trustee Beneficiary (Section 71(5))'] = st.number_input("25. Expenditure or Loss by Trustee Beneficiary", min_value=0.0, format="%.2f")
-allowables['Expenditure or Loss by Beneficiary of Deceased Estate (Section 72(2))'] = st.number_input("26. Expenditure or Loss by Beneficiary of Deceased Estate", min_value=0.0, format="%.2f")
-allowables['Limitation on Deduction for Petroleum Operations (Section 91(1))'] = st.number_input("27. Limitation on Deduction - Petroleum Operations", min_value=0.0, format="%.2f")
-allowables['Decommission Costs & Expenditures - Petroleum (Section 99(2))'] = st.number_input("28. Decommission Costs & Expenditures - Petroleum", min_value=0.0, format="%.2f")
-allowables['Unrealised Gains (Section 46)'] = st.number_input("29. Unrealised Gains", min_value=0.0, format="%.2f")
-allowables['Impairment of Asset'] = st.number_input("30. Impairment of Asset", min_value=0.0, format="%.2f")
-allowables['Decrease in Provision for Bad Debts (Section 24)'] = st.number_input("31. Decrease in Provision for Bad Debts", min_value=0.0, format="%.2f")
-allowables['Bad Debts Written Off (Section 24)'] = st.number_input("32. Bad Debts Written Off", min_value=0.0, format="%.2f")
-allowables['Staff Costs - Business Travel (Section 22)'] = st.number_input("33. Staff Costs - Business Travel Expenses", min_value=0.0, format="%.2f")
-allowables['Private Employer Disability Tax (Section 22(1)(e))'] = st.number_input("34. 2% Income Tax Payable for Private Employers with 5% Disabled Employees", min_value=0.0, format="%.2f")
-allowables['Rental Income Expenditure & Losses (Section 22(1)(c)(2))'] = st.number_input("35. Rental Income Expenditure & Losses", min_value=0.0, format="%.2f")
-allowables['Local Service Tax (Section 22(1)(d))'] = st.number_input("36. Local Service Tax", min_value=0.0, format="%.2f")
-allowables['Interest Income on Treasury Bills (Section 139(a))'] = st.number_input("37. Interest Income on Treasury Bills", min_value=0.0, format="%.2f")
-allowables['Interest on Circulating Capital'] = st.number_input("38. Interest on Circulating Capital", min_value=0.0, format="%.2f")
-allowables['Interest Income on Treasury Bonds (Section 139(a))'] = st.number_input("39. Interest Income on Treasury Bonds", min_value=0.0, format="%.2f")
-allowables['Specific Provisions for Bad Debts (Financial Institutions)'] = st.number_input("40. Specific Provisions for Bad Debts (F.I.)", min_value=0.0, format="%.2f")
-allowables['Revaluation Gains (Financial Institutions)'] = st.number_input("41. Revaluation Gains (F.I.)", min_value=0.0, format="%.2f")
-allowables['Rental Income (Section 5(3)(a))'] = st.number_input("42. Rental Income", min_value=0.0, format="%.2f")
-allowables['Interest Income from Treasury Bills (Section 139(a)(c)(d))'] = st.number_input("43. Interest Income from Treasury Bills", min_value=0.0, format="%.2f")
-allowables['Interest Income from Treasury Bonds (Section 139(a)(c)(d))'] = st.number_input("44. Interest Income from Treasury Bonds", min_value=0.0, format="%.2f")
-allowables['Legal Expenses on Breach of Contract to Revenue Account'] = st.number_input("45. Legal Expenses on Breach of Contract to Revenue Account", min_value=0.0, format="%.2f")
-allowables['Legal Expenses on Maintenance of Capital Assets'] = st.number_input("46. Legal Expenses on Maintenance of Capital Assets", min_value=0.0, format="%.2f")
-allowables['Legal Expenses on Existing Trade Rights'] = st.number_input("47. Legal Expenses on Already Existing Trade Rights", min_value=0.0, format="%.2f")
-allowables['Legal Expenses Incidental to Revenue Items'] = st.number_input("48. Legal Expenses Incidental to Revenue Items", min_value=0.0, format="%.2f")
-allowables['Legal Expenses on Debt Collection - Trade Debts'] = st.number_input("49. Legal Expenses on Debt Collection Related to Trade Debts", min_value=0.0, format="%.2f")
-allowables['Closing Tax Written Down Value < UGX1M (Section 27(6))'] = st.number_input("50. Closing Tax Written Down Value Less Than 1 Million", min_value=0.0, format="%.2f")
-allowables['Intangible Assets'] = st.number_input("51. Intangible Assets", min_value=0.0, format="%.2f")
-allowables['Legal Expenses for Renewal of Loans (Financial Institutions)'] = st.number_input("52. Legal Expenses for Renewal of Loans", min_value=0.0, format="%.2f")
-allowables['Interest on Debt Obligation (Loan) (Section 25(1))'] = st.number_input("53. Interest on Debt Obligation", min_value=0.0, format="%.2f")
-allowables['Interest on Debt Obligation by Group Member (30% EBITDA) (Section 25(3))'] = st.number_input("54. Interest on Debt Obligation by Group Member", min_value=0.0, format="%.2f")
-allowables['Gains & Losses on Disposal of Assets (Section 22(1)(b))'] = st.number_input("55. Gains & Losses on Disposal of Assets", min_value=0.0, format="%.2f")
-allowables['Balancing Allowance (Sections 27(7))'] = st.number_input("56. Balancing Allowance", min_value=0.0, format="%.2f")
-
-# SECTION 5: Sum Allowables
-total_allowables = sum(allowables.values())
-
-# SECTION 6: Compute Chargeable Income
-chargeable_income = adjusted_profit - total_allowables
-
-st.markdown(f"### Chargeable Income: UGX {chargeable_income:,.2f}")
-
-# SECTION 7: Provisional Tax & Withholding Tax
-st.header("4. Taxes Paid & Adjustments")
-
-provisional_tax = st.number_input("Provisional Taxes Paid", min_value=0.0, format="%.2f")
-withholding_tax = st.number_input("Withholding Tax Deducted", min_value=0.0, format="%.2f")
-
-# Provision adjustments
-st.subheader("5. Provision Adjustments")
-
-increase_in_provision = st.number_input("Increase in Provision (Add)", min_value=0.0, format="%.2f")
-decrease_in_provision = st.number_input("Decrease in Provision (Less)", min_value=0.0, format="%.2f")
-
-# Apply provision adjustments to chargeable income
-chargeable_income_adjusted = chargeable_income + increase_in_provision - decrease_in_provision
-
-st.markdown(f"### Adjusted Chargeable Income (after provisions): UGX {chargeable_income_adjusted:,.2f}")
-
-# SECTION 8: Final Tax Computation
-tax_payable = chargeable_income_adjusted * TAX_RATE
-
-final_tax_payable = tax_payable - provisional_tax - withholding_tax
-
-st.header("6. Final Tax Computation")
-
-st.markdown(f"**Tax Payable (30% of Adjusted Chargeable Income):** UGX {tax_payable:,.2f}")
-st.markdown(f"**Less: Provisional Tax Paid:** UGX {provisional_tax:,.2f}")
-st.markdown(f"**Less: Withholding Tax:** UGX {withholding_tax:,.2f}")
-st.markdown(f"---")
-st.markdown(f"### **Final Income Tax Payable / Claimable:** UGX {final_tax_payable:,.2f}")
-
-# Optionally display messages if tax is negative (claimable)
-if final_tax_payable < 0:
-    st.success("Note: Tax payable is negative; this implies a claimable/refundable tax amount.")
-
-# SECTION 9: Additional Notes
-st.header("7. Additional Notes")
-
-additional_notes = st.text_area("Additional Notes (if any)", height=150)
-
-# Export to CSV or Excel - basic example
-import pandas as pd
-from io import BytesIO
-
-def to_excel(df):
-    output = BytesIO()
-    writer = pd.ExcelWriter(output, engine='xlsxwriter')
-    df.to_excel(writer, index=False, sheet_name='Tax Computation')
-    writer.save()
-    processed_data = output.getvalue()
-    return processed_data
-
-if st.button("Download Computation Summary as Excel"):
-    # Prepare data for export
-    data_export = {
-        "Title": [title],
-        "PBIT": [pbit],
-        "Adjusted Profit": [adjusted_profit],
-        "Total Allowables": [total_allowables],
-        "Chargeable Income": [chargeable_income],
-        "Increase in Provision": [increase_in_provision],
-        "Decrease in Provision": [decrease_in_provision],
-        "Adjusted Chargeable Income": [chargeable_income_adjusted],
-        "Tax Payable (30%)": [tax_payable],
-        "Provisional Tax Paid": [provisional_tax],
-        "Withholding Tax": [withholding_tax],
-        "Final Tax Payable / Claimable": [final_tax_payable],
-        "Additional Notes": [additional_notes],
-    }
-
 st.markdown("---")
-st.markdown("**Disclaimer:** This app is a simplified tax computation tool based on Uganda ITA Cap 338 and should not replace professional tax advice.")
+st.markdown("**Disclaimer:** This app is a simplified tax computation tool based on Uganda ITA Cap 338.")
 
 
